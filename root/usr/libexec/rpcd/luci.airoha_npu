@@ -493,9 +493,121 @@ get_frame_engine() {
 	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
 }
 
+
+# Read-only AN7581 datapath telemetry.
+# Register addresses/roles are cross-checked against the public ClankerNPU
+# AN7581 PPE/HWNAT reference implementation. This method never writes registers.
+get_data_path() {
+	local entries_file="/sys/kernel/debug/ppe/entries"
+	local bind_file="/sys/kernel/debug/ppe/bind"
+	local bnd=0 unb=0 ipv4=0 ipv6=0 l2b=0 pppoe_tokens=0
+	local ppe_debugfs="false"
+
+	if [ -f "$entries_file" ]; then
+		ppe_debugfs="true"
+		bnd=$(grep -cE '^[0-9a-fA-F]+[[:space:]]+BND([[:space:]]|$)' "$entries_file" 2>/dev/null); [ -n "$bnd" ] || bnd=0
+		unb=$(grep -cE '^[0-9a-fA-F]+[[:space:]]+UNB([[:space:]]|$)' "$entries_file" 2>/dev/null); [ -n "$unb" ] || unb=0
+		ipv4=$(grep -cE '^[0-9a-fA-F]+[[:space:]]+(BND|UNB)[[:space:]]+IPv4([[:space:]]|$)' "$entries_file" 2>/dev/null); [ -n "$ipv4" ] || ipv4=0
+		ipv6=$(grep -cE '^[0-9a-fA-F]+[[:space:]]+(BND|UNB)[[:space:]]+IPv6([[:space:]]|$)' "$entries_file" 2>/dev/null); [ -n "$ipv6" ] || ipv6=0
+		l2b=$(grep -cE '(^|[[:space:]])L2B([[:space:]]|$)' "$entries_file" 2>/dev/null); [ -n "$l2b" ] || l2b=0
+		pppoe_tokens=$(grep -ci 'pppoe' "$entries_file" 2>/dev/null); [ -n "$pppoe_tokens" ] || pppoe_tokens=0
+	elif [ -f "$bind_file" ]; then
+		ppe_debugfs="true"
+		bnd=$(grep -cE '^[0-9a-fA-F]' "$bind_file" 2>/dev/null); [ -n "$bnd" ] || bnd=0
+	fi
+
+	local flow_sw=0 flow_hw=0 nft_hw="false"
+	if command -v uci >/dev/null 2>&1; then
+		flow_sw=$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null || echo 0)
+		flow_hw=$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null || echo 0)
+	fi
+	if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'flags offload'; then
+		nft_hw="true"
+	fi
+
+	# Discover mwan3 interface sections and correlate their live L3 address with
+	# visible PPE entries. The correlation is a diagnostic heuristic, not byte accounting.
+	local mwan3_present="false" wan_json="" sec
+	if command -v uci >/dev/null 2>&1 && uci -q show mwan3 >/dev/null 2>&1; then
+		mwan3_present="true"
+		for sec in $(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^.=]*\)=interface$/\1/p'); do
+			local enabled up proto l3 ipv4_addr matched status_json
+			enabled=$(uci -q get "mwan3.$sec.enabled" 2>/dev/null || echo 1)
+			up="false"; proto=""; l3=""; ipv4_addr=""; matched=0
+			if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+				status_json=$(ubus call "network.interface.$sec" status 2>/dev/null)
+				if [ -n "$status_json" ]; then
+					[ "$(echo "$status_json" | jsonfilter -e '@.up' 2>/dev/null)" = "true" ] && up="true"
+					proto=$(echo "$status_json" | jsonfilter -e '@.proto' 2>/dev/null | head -1)
+					l3=$(echo "$status_json" | jsonfilter -e '@.l3_device' 2>/dev/null | head -1)
+					ipv4_addr=$(echo "$status_json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null | head -1)
+				fi
+			fi
+			if [ -n "$ipv4_addr" ] && [ -f "$entries_file" ]; then
+				matched=$(grep -F "$ipv4_addr" "$entries_file" 2>/dev/null | grep -cE '^[0-9a-fA-F]+[[:space:]]+BND([[:space:]]|$)')
+				[ -n "$matched" ] || matched=0
+			fi
+			local sec_e proto_e l3_e ip_e
+			sec_e=$(json_escape "$sec"); proto_e=$(json_escape "$proto"); l3_e=$(json_escape "$l3"); ip_e=$(json_escape "$ipv4_addr")
+			[ -n "$wan_json" ] && wan_json="$wan_json,"
+			wan_json="$wan_json{\"name\":\"$sec_e\",\"enabled\":$enabled,\"up\":$up,\"proto\":\"$proto_e\",\"l3_device\":\"$l3_e\",\"ipv4\":\"$ip_e\",\"matched_bnd\":$matched}"
+		done
+	fi
+
+	# Optional read-only runtime register snapshot. Keep values raw where the
+	# bitfield semantics are not proven by the current kernel/vendor docs.
+	local devmem_ok="false"
+	local chip_id="N/A" chip_variant="N/A" chip_family=-1 chip_rev=-1
+	local ppe0_ctrl="N/A" ppe1_ctrl="N/A" ppe0_parser="N/A" ppe1_parser="N/A"
+	local etype_en="N/A" bind_lmt0="N/A" bind_lmt1="N/A" unb_age="N/A"
+	local bnd_age0="N/A" bnd_age1="N/A" hash_seed="N/A" dft_cport="N/A"
+	local qdma0="N/A" qdma1="N/A" qdma2="N/A"
+
+	if command -v devmem >/dev/null 2>&1 && [ -e /dev/mem ]; then
+		devmem_ok="true"
+		chip_id=$(devmem 0x1FB00064 32 2>/dev/null || echo N/A)
+		chip_variant=$(devmem 0x1FB00284 32 2>/dev/null || echo N/A)
+		case "$chip_id" in
+			0x*|0X*) chip_family=$((chip_id >> 16)) ;;
+		esac
+		case "$chip_variant" in
+			0x*|0X*) chip_rev=$(( ((chip_variant >> 3) & 0x10) | (chip_variant & 0xF) )) ;;
+		esac
+		ppe0_ctrl=$(devmem 0x1FB50E00 32 2>/dev/null || echo N/A)
+		ppe1_ctrl=$(devmem 0x1FB51E00 32 2>/dev/null || echo N/A)
+		ppe0_parser=$(devmem 0x1FB50E88 32 2>/dev/null || echo N/A)
+		ppe1_parser=$(devmem 0x1FB51E88 32 2>/dev/null || echo N/A)
+		etype_en=$(devmem 0x1FB50E8C 32 2>/dev/null || echo N/A)
+		bind_lmt0=$(devmem 0x1FB50E2C 32 2>/dev/null || echo N/A)
+		bind_lmt1=$(devmem 0x1FB50E30 32 2>/dev/null || echo N/A)
+		unb_age=$(devmem 0x1FB50E38 32 2>/dev/null || echo N/A)
+		bnd_age0=$(devmem 0x1FB50E3C 32 2>/dev/null || echo N/A)
+		bnd_age1=$(devmem 0x1FB50E40 32 2>/dev/null || echo N/A)
+		hash_seed=$(devmem 0x1FB50E44 32 2>/dev/null || echo N/A)
+		dft_cport=$(devmem 0x1FB50E48 32 2>/dev/null || echo N/A)
+		qdma0=$(devmem 0x1FB50500 32 2>/dev/null || echo N/A)
+		qdma1=$(devmem 0x1FB51500 32 2>/dev/null || echo N/A)
+		qdma2=$(devmem 0x1FB52500 32 2>/dev/null || echo N/A)
+	fi
+
+	printf '{"flow_offloading":%s,"flow_offloading_hw":%s,"nft_hw_flowtable":%s,"ppe_debugfs":%s,' \
+		"$flow_sw" "$flow_hw" "$nft_hw" "$ppe_debugfs"
+	printf '"flows":{"bnd":%d,"unb":%d,"ipv4":%d,"ipv6":%d,"l2b":%d,"pppoe_tokens":%d},' \
+		"$bnd" "$unb" "$ipv4" "$ipv6" "$l2b" "$pppoe_tokens"
+	printf '"mwan3_present":%s,"wans":[%s],' "$mwan3_present" "$wan_json"
+	printf '"registers":{"available":%s,"chip_id":"%s","chip_variant":"%s","chip_family":%d,"chip_rev":%d,' \
+		"$devmem_ok" "$(json_escape "$chip_id")" "$(json_escape "$chip_variant")" "$chip_family" "$chip_rev"
+	printf '"ppe0_ctrl":"%s","ppe1_ctrl":"%s","ppe0_parser":"%s","ppe1_parser":"%s","etype_en":"%s",' \
+		"$(json_escape "$ppe0_ctrl")" "$(json_escape "$ppe1_ctrl")" "$(json_escape "$ppe0_parser")" "$(json_escape "$ppe1_parser")" "$(json_escape "$etype_en")"
+	printf '"bind_lmt0":"%s","bind_lmt1":"%s","unb_age":"%s","bnd_age0":"%s","bnd_age1":"%s","hash_seed":"%s","dft_cport":"%s",' \
+		"$(json_escape "$bind_lmt0")" "$(json_escape "$bind_lmt1")" "$(json_escape "$unb_age")" "$(json_escape "$bnd_age0")" "$(json_escape "$bnd_age1")" "$(json_escape "$hash_seed")" "$(json_escape "$dft_cport")"
+	printf '"qdma0":"%s","qdma1":"%s","qdma2":"%s"}}' \
+		"$(json_escape "$qdma0")" "$(json_escape "$qdma1")" "$(json_escape "$qdma2")"
+}
+
 case "$1" in
 	list)
-		echo '{"getStatus":{},"getPpeEntries":{},"getFrameEngine":{},"setGovernor":{"governor":"str"},"setMaxFreq":{"freq":"int"},"setOverclock":{"freq_mhz":"int"}}'
+		echo '{"getStatus":{},"getPpeEntries":{},"getFrameEngine":{},"getDataPath":{},"setGovernor":{"governor":"str"},"setMaxFreq":{"freq":"int"},"setOverclock":{"freq_mhz":"int"}}'
 		;;
 	call)
 		case "$2" in
@@ -519,6 +631,9 @@ case "$1" in
 				;;
 			getFrameEngine)
 				get_frame_engine
+				;;
+			getDataPath)
+				get_data_path
 				;;
 			*)
 				echo '{"error":"Invalid method"}'
