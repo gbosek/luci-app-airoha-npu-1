@@ -6,7 +6,7 @@ Real-time monitoring and management dashboard for the Airoha AN7581 SoC on OpenW
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-24.10%2B-brightgreen.svg)
-![Version](https://img.shields.io/badge/version-1.2.1-orange.svg)
+![Version](https://img.shields.io/badge/version-1.3.0-orange.svg)
 
 ## Screenshots
 
@@ -45,6 +45,14 @@ Real-time monitoring and management dashboard for the Airoha AN7581 SoC on OpenW
 ### PPE Flow Offload Table
 - First 100 PPE entries with state (BND/UNB), type (IPv4/IPv6/L2B), 5-tuple, and MAC addresses
 - Auto-refreshes every 5 seconds
+### AN7581 Datapath / Dual-WAN Telemetry
+- Read-only view of Linux flow offload -> PPE/FOE -> PSE/QDMA -> Ethernet/PON
+- 5-second **delta** HWF-vs-CPU share from CDM1/CDM2 counters (avoids misleading lifetime ratios)
+- PPE BND/UNB coverage plus IPv4 / IPv6 / L2B evidence
+- `mwan3` interface discovery with live protocol/L3 device/address and heuristic BND-flow correlation
+- Optional raw PPE/QDMA runtime register snapshot based on the public ClankerNPU AN7581 register map
+- AN7581 chip family/revision decoding using the ClankerNPU family/revision formula
+- Observation only: the new telemetry path does not reset the NPU or write PPE/QDMA registers
 
 ### Theme Support
 - Auto-detects dark/light mode by sampling page background luminance at runtime
@@ -95,6 +103,8 @@ ssh root@router 'chmod +x /usr/libexec/rpcd/luci.airoha_npu && /etc/init.d/rpcd 
 | Overclock PLL | `devmem` registers (0x1fa202b4, 0x1fa202b8) | devmem |
 | PPE entries | `/sys/kernel/debug/ppe/{entries,bind}` | Yes |
 | Frame Engine (GDM/CDM/PSE) | `devmem` registers (0x1fb50xxx-0x1fb53xxx) | devmem |
+| PPE/QDMA runtime snapshot | read-only `devmem` of AN7581 PPE/QDMA registers | devmem |
+| Dual-WAN view | `mwan3` UCI + `network.interface.*` ubus + PPE debugfs | Optional |
 
 ## Project Structure
 
@@ -123,11 +133,19 @@ luci-app-airoha-npu/
 | `getStatus` | NPU, CPU, PPE summary | — |
 | `getPpeEntries` | PPE flow table (first 100) | — |
 | `getFrameEngine` | PSE/GDM/CDM register counters | — |
+| `getDataPath` | Read-only flow-offload, mwan3, PPE/QDMA runtime telemetry | — |
 | `setGovernor` | Change CPU governor | `governor` |
 | `setMaxFreq` | Set CPU max frequency | `freq` (kHz) |
 | `setOverclock` | Direct PLL frequency set | `freq_mhz` |
 
 ## Version History
+
+### v1.3.0 (experimental)
+- Added read-only AN7581 datapath dashboard focused on wired dual-WAN/PPE offload
+- Added BND/UNB, IPv4/IPv6/L2B evidence and live HWF-vs-CPU delta sampling
+- Added mwan3 WAN discovery and heuristic per-WAN BND correlation
+- Added optional raw PPE/QDMA runtime register snapshot for stock NPU firmware analysis
+- No NPU firmware replacement and no new PPE/QDMA register writes
 
 ### v1.2.1
 - Fixed PSE port mapping table (corrected P0-P9 indices, added missing P9)
