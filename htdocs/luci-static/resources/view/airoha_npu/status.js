@@ -7,6 +7,7 @@
 var callNpuStatus = rpc.declare({ object: 'luci.airoha_npu', method: 'getStatus' });
 var callPpeEntries = rpc.declare({ object: 'luci.airoha_npu', method: 'getPpeEntries' });
 var callFrameEngine = rpc.declare({ object: 'luci.airoha_npu', method: 'getFrameEngine' });
+var callDataPath = rpc.declare({ object: 'luci.airoha_npu', method: 'getDataPath' });
 var callSetGovernor = rpc.declare({ object: 'luci.airoha_npu', method: 'setGovernor', params: ['governor'] });
 var callSetMaxFreq = rpc.declare({ object: 'luci.airoha_npu', method: 'setMaxFreq', params: ['freq'] });
 var callSetOverclock = rpc.declare({ object: 'luci.airoha_npu', method: 'setOverclock', params: ['freq_mhz'] });
@@ -228,10 +229,10 @@ function renderFeDiagram(fe, st) {
 			E('span', { 'style': 'font-weight:bold;color:#00bcd4;font-size:14px' }, 'NPU'),
 			E('span', { 'style': 'background:'+(npuActive?'#00695c':'#666')+';color:#fff;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:600' }, npuActive ? _('ACTIVE') : _('OFF'))
 		]),
-		E('div', { 'class': 'soc-label', 'style': 'margin-bottom:4px' }, '8x RISC-V via PCIe RAM'),
+		E('div', { 'class': 'soc-label', 'style': 'margin-bottom:4px' }, (st.npu_cores||'?') + 'x RISC-V NPU harts'),
 		E('div', { 'style': 'font-size:11px' }, [
 			E('span', { 'class': 'soc-muted' }, _('Manages: ')),
-			E('span', { 'class': 'soc-text', 'style': 'font-size:11px' }, _('PPE init, flow offload, packet processing'))
+			E('span', { 'class': 'soc-text', 'style': 'font-size:11px' }, _('PPE/HWNAT control, QDMA coordination and special fast paths'))
 		])
 	]);
 
@@ -390,14 +391,170 @@ function renderPpeRows(entries) {
 	});
 }
 
+
+/* ── AN7581 datapath telemetry (read-only) ── */
+var _lastHwSample = null;
+
+function delta32(now, prev) {
+	now = Number(now) >>> 0;
+	prev = Number(prev) >>> 0;
+	return now >= prev ? now - prev : (0x100000000 - prev + now);
+}
+
+function sampleHwShare(fe) {
+	fe = fe || {};
+	var cur = {
+		cpu: ((Number((fe.cdm1||{}).rx_cpu)||0) + (Number((fe.cdm2||{}).rx_cpu)||0)) >>> 0,
+		hwf: ((Number((fe.cdm1||{}).rx_hwf)||0) + (Number((fe.cdm2||{}).rx_hwf)||0)) >>> 0
+	};
+	if (!_lastHwSample) {
+		_lastHwSample = cur;
+		return null;
+	}
+	var cpu = delta32(cur.cpu, _lastHwSample.cpu);
+	var hwf = delta32(cur.hwf, _lastHwSample.hwf);
+	_lastHwSample = cur;
+	var total = cpu + hwf;
+	return total > 0 ? { cpu: cpu, hwf: hwf, pct: hwf * 100 / total } : { cpu: 0, hwf: 0, pct: null };
+}
+
+function dpPill(text, good, warn) {
+	var cls = good ? 'label-success' : (warn ? 'label-warning' : 'label-danger');
+	return E('span', { 'class': cls, 'style': 'display:inline-block;min-width:46px;text-align:center' }, text);
+}
+
+function renderDataPath(dp, fe, st) {
+	dp = dp || {};
+	var flows = dp.flows || {};
+	var regs = dp.registers || {};
+	var wans = Array.isArray(dp.wans) ? dp.wans : [];
+	var total = (Number(flows.bnd)||0) + (Number(flows.unb)||0);
+	var coverage = total > 0 ? (Number(flows.bnd)||0) * 100 / total : null;
+	var share = sampleHwShare(fe);
+	var hwText = share && share.pct != null ? share.pct.toFixed(1) + '%' : _('Sampling…');
+	var hwSub = share ? _('Δ HWF %d / CPU %d').format(share.hwf, share.cpu) : _('5-second counter delta, not cumulative ratio');
+
+	function metric(title, value, note, good, warn) {
+		return E('div', { 'class': 'soc-card', 'style': 'min-width:155px;flex:1' }, [
+			E('div', { 'class': 'soc-label', 'style': 'margin-bottom:4px' }, title),
+			E('div', { 'class': 'soc-text', 'style': 'font-size:20px;font-weight:700;line-height:1.2' }, value),
+			note ? E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:5px' }, note) : '',
+			good === undefined ? '' : E('div', { 'style': 'margin-top:7px' }, dpPill(good ? _('OK') : (warn ? _('Check') : _('Off')), good, warn))
+		]);
+	}
+
+	var wanCards = wans.map(function(w) {
+		var active = !!w.up;
+		var pppoe = String(w.proto||'').toLowerCase() === 'pppoe';
+		var match = Number(w.matched_bnd)||0;
+		return E('div', { 'class': 'soc-card', 'style': 'min-width:190px;flex:1' }, [
+			E('div', { 'style': 'display:flex;justify-content:space-between;gap:8px;align-items:center' }, [
+				E('strong', { 'class': 'soc-text' }, w.name || _('WAN')),
+				dpPill(active ? _('UP') : _('DOWN'), active, !active)
+			]),
+			E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:5px' },
+				(pppoe ? 'PPPoE · ' : '') + (w.l3_device || _('no L3 device')) + (w.ipv4 ? ' · '+w.ipv4 : '')),
+			E('div', { 'class': 'soc-text', 'style': 'font-size:12px;margin-top:7px' }, [
+				_('Matched BND flows: '), E('strong', {}, String(match))
+			])
+		]);
+	});
+	if (!wanCards.length) {
+		wanCards.push(E('div', { 'class': 'soc-card soc-muted', 'style': 'min-width:190px;flex:1' },
+			dp.mwan3_present ? _('mwan3 is present, but no interface sections were resolved.') : _('mwan3 is not installed/configured on this system.')));
+	}
+
+	var regRows = [
+		['SoC', regs.available ? ('family '+regs.chip_family+' rev '+regs.chip_rev+' · '+regs.chip_id+' / '+regs.chip_variant) : 'N/A'],
+		['PPE0_CTRL / PPE1_CTRL', (regs.ppe0_ctrl||'N/A')+' / '+(regs.ppe1_ctrl||'N/A')],
+		['PPE0_PARSER / PPE1_PARSER', (regs.ppe0_parser||'N/A')+' / '+(regs.ppe1_parser||'N/A')],
+		['ETYPE_EN', regs.etype_en||'N/A'],
+		['BIND_LMT0 / BIND_LMT1', (regs.bind_lmt0||'N/A')+' / '+(regs.bind_lmt1||'N/A')],
+		['UNB_AGE', regs.unb_age||'N/A'],
+		['BND_AGE0 / BND_AGE1', (regs.bnd_age0||'N/A')+' / '+(regs.bnd_age1||'N/A')],
+		['HASH_SEED', regs.hash_seed||'N/A'],
+		['DFT_CPORT', regs.dft_cport||'N/A'],
+		['PPE_QDMA0 / 1 / 2', (regs.qdma0||'N/A')+' / '+(regs.qdma1||'N/A')+' / '+(regs.qdma2||'N/A')]
+	];
+
+	return E('div', {}, [
+		E('div', { 'style': 'display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px' }, [
+			metric(_('Hardware Flow Offload'), dp.flow_offloading_hw ? _('ON') : _('OFF'),
+				dp.flow_offloading ? _('software flow offload is enabled') : _('software flow offload is disabled'),
+				!!dp.flow_offloading_hw, !!dp.flow_offloading && !dp.flow_offloading_hw),
+			metric(_('nft HW flowtable'), dp.nft_hw_flowtable ? _('OFFLOAD') : _('Not seen'),
+				_('Checks for flags offload in the live nft ruleset'), !!dp.nft_hw_flowtable, !!dp.flow_offloading_hw && !dp.nft_hw_flowtable),
+			metric(_('PPE binding coverage'), coverage == null ? '—' : coverage.toFixed(1)+'%',
+				_('BND %d · UNB %d').format(Number(flows.bnd)||0, Number(flows.unb)||0),
+				coverage != null && coverage > 0, coverage === 0),
+			metric(_('Steady-state HWF share'), hwText, hwSub,
+				share && share.pct != null ? share.pct > 0 : undefined, false)
+		]),
+		E('div', { 'class': 'soc-card', 'style': 'margin-bottom:10px' }, [
+			E('div', { 'class': 'soc-text', 'style': 'font-weight:700;margin-bottom:7px' }, _('AN7581 fast-path model')),
+			E('div', { 'style': 'display:flex;align-items:stretch;gap:7px;flex-wrap:wrap' }, [
+				E('div', { 'style': 'flex:1;min-width:135px' }, [
+					E('strong', { 'class': 'soc-text' }, _('Linux control')),
+					E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:4px' }, _('mwan3 · conntrack · PPPoE control · first packets'))
+				]),
+				E('div', { 'class': 'soc-muted', 'style': 'align-self:center;font-size:20px' }, '→'),
+				E('div', { 'style': 'flex:1;min-width:135px' }, [
+					E('strong', { 'class': 'soc-text' }, 'PPE / FOE'),
+					E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:4px' },
+						_('IPv4 %d · IPv6 %d · L2B %d').format(Number(flows.ipv4)||0, Number(flows.ipv6)||0, Number(flows.l2b)||0))
+				]),
+				E('div', { 'class': 'soc-muted', 'style': 'align-self:center;font-size:20px' }, '→'),
+				E('div', { 'style': 'flex:1;min-width:135px' }, [
+					E('strong', { 'class': 'soc-text' }, 'PSE / QDMA'),
+					E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:4px' }, _('hardware switching, queues and egress'))
+				]),
+				E('div', { 'class': 'soc-muted', 'style': 'align-self:center;font-size:20px' }, '→'),
+				E('div', { 'style': 'flex:1;min-width:135px' }, [
+					E('strong', { 'class': 'soc-text' }, _('Ethernet / PON WAN')),
+					E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:4px' }, _('eligible steady-state flows should stay off the ARM CPU'))
+				])
+			])
+		]),
+		E('div', { 'class': 'soc-text', 'style': 'font-size:12px;font-weight:700;margin:10px 0 6px' }, _('Dual-WAN / mwan3 view')),
+		E('div', { 'style': 'display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px' }, wanCards),
+		E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-bottom:10px' },
+			_('Matched BND is a heuristic correlation using the WAN IPv4 address in the visible PPE table. It verifies evidence, not per-WAN byte accounting.')),
+		E('div', { 'class': 'soc-card', 'style': 'margin-bottom:10px' }, [
+			E('div', { 'class': 'soc-text', 'style': 'font-weight:700;margin-bottom:6px' }, _('Protocol / bridge evidence')),
+			E('div', { 'style': 'display:flex;gap:16px;flex-wrap:wrap;font-size:12px' }, [
+				E('span', {}, [_('IPv4 entries: '), E('strong', {}, String(Number(flows.ipv4)||0))]),
+				E('span', {}, [_('IPv6 entries: '), E('strong', {}, String(Number(flows.ipv6)||0))]),
+				E('span', {}, [_('L2B entries: '), E('strong', {}, String(Number(flows.l2b)||0))]),
+				E('span', {}, [_('PPPoE text tokens: '), E('strong', {}, String(Number(flows.pppoe_tokens)||0))])
+			]),
+			E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin-top:6px' },
+				_('A zero PPPoE token count does not mean PPPoE offload is absent; some PPE debugfs formats do not print PPPoE session metadata.'))
+		]),
+		E('details', {}, [
+			E('summary', { 'class': 'soc-text', 'style': 'cursor:pointer;font-weight:600' }, _('Read-only PPE/QDMA runtime register snapshot')),
+			E('div', { 'class': 'soc-muted', 'style': 'font-size:11px;margin:6px 0' },
+				_('Addresses are used only for observation. Raw fields are intentionally not decoded unless their semantics are verified.')),
+			E('div', { 'class': 'soc-table-wrap' }, [
+				E('table', { 'class': 'table', 'style': 'min-width:520px' },
+					regRows.map(function(r) {
+						return E('tr', { 'class': 'tr' }, [
+							E('td', { 'class': 'td', 'style': 'font-weight:600' }, r[0]),
+							E('td', { 'class': 'td', 'style': 'font-family:monospace' }, r[1])
+						]);
+					}))
+			])
+		])
+	]);
+}
+
 /* ── Main View ── */
 return view.extend({
 	load: function() {
-		return Promise.all([ callNpuStatus(), callPpeEntries(), callFrameEngine() ]);
+		return Promise.all([ callNpuStatus(), callPpeEntries(), callFrameEngine(), callDataPath() ]);
 	},
 	render: function(data) {
 		injectCSS();
-		var st = data[0]||{}, ppe = data[1]||{}, fe = data[2]||{};
+		var st = data[0]||{}, ppe = data[1]||{}, fe = data[2]||{}, dp = data[3]||{};
 		var entries = Array.isArray(ppe.entries) ? ppe.entries : [];
 		var memR = Array.isArray(st.memory_regions) ? st.memory_regions : [];
 		var freqSource = st.cpu_freq_source || 'cpufreq';
@@ -435,6 +592,12 @@ return view.extend({
 				E('div',{'style':'margin-top:12px'},[ E('h4',{'class':'soc-text','style':'font-size:14px;margin-bottom:8px'},_('Frame Engine'))]),
 				E('div',{'id':'fe-container'}, renderFeDiagram(fe, st))
 			]),
+			// Read-only AN7581 datapath / dual-WAN telemetry
+			E('div',{'class':'cbi-section'},[
+				E('h3',{},_('AN7581 Datapath / Dual-WAN')),
+				E('p',{'class':'soc-muted','style':'font-size:12px'},_('Read-only visualization of Linux flow offload, PPE/FOE, PSE/QDMA and mwan3 WAN evidence. The running NPU firmware is not replaced or reset.')),
+				E('div',{'id':'dp-container'}, renderDataPath(dp, fe, st))
+			]),
 			// PPE Flow Table - with responsive scroll wrapper
 			E('div',{'class':'cbi-section'},[
 				E('h3',{},_('PPE Flow Offload Entries')),
@@ -450,9 +613,9 @@ return view.extend({
 		]);
 
 		poll.add(L.bind(function() {
-			return Promise.all([ callNpuStatus(), callPpeEntries(), callFrameEngine() ]).then(L.bind(function(d) {
+			return Promise.all([ callNpuStatus(), callPpeEntries(), callFrameEngine(), callDataPath() ]).then(L.bind(function(d) {
 				injectCSS();
-				var st=d[0]||{}, ppe=d[1]||{}, fe=d[2]||{};
+				var st=d[0]||{}, ppe=d[1]||{}, fe=d[2]||{}, dp=d[3]||{};
 				var entries = Array.isArray(ppe.entries)?ppe.entries:[];
 				var freqSrc = st.cpu_freq_source || 'cpufreq';
 
@@ -472,6 +635,8 @@ return view.extend({
 				if(se){se.innerHTML='';var sp=document.createElement('span');sp.className=st.npu_loaded?'label-success':'label-danger';sp.textContent=st.npu_loaded?(_('Active')+(st.npu_device?' ('+st.npu_device+')':'')):_('Not Active');se.appendChild(sp);}
 
 				var fc=document.getElementById('fe-container'); if(fc){fc.innerHTML='';fc.appendChild(renderFeDiagram(fe, st));}
+
+				var dc=document.getElementById('dp-container'); if(dc){dc.innerHTML='';dc.appendChild(renderDataPath(dp, fe, st));}
 
 				var tb=document.getElementById('ppe-entries-table');
 				if(tb){while(tb.rows.length>1)tb.deleteRow(1);renderPpeRows(entries).forEach(function(r){tb.appendChild(r);});}
